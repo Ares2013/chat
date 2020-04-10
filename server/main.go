@@ -35,6 +35,7 @@ import (
 	_ "github.com/tinode/chat/server/auth/token"
 
 	// Database backends
+	_ "github.com/tinode/chat/server/db/mongodb"
 	_ "github.com/tinode/chat/server/db/mysql"
 	_ "github.com/tinode/chat/server/db/rethinkdb"
 
@@ -87,7 +88,10 @@ const (
 	// maxDeleteCount is the maximum allowed number of messages to delete in one call.
 	defaultMaxDeleteCount = 1024
 
-	// Mount point where static content is served, http://host-name/<defaultStaticMount>
+	// Base URL path for serving the streaming API.
+	defaultApiPath = "/"
+
+	// Mount point where static content is served, http://host-name<defaultStaticMount>
 	defaultStaticMount = "/"
 
 	// Local path to static content
@@ -182,12 +186,15 @@ type mediaConfig struct {
 
 // Contentx of the configuration file
 type configType struct {
-	// Default HTTP(S) address:port to listen on for websocket and long polling clients. Either a
+	// HTTP(S) address:port to listen on for websocket and long polling clients. Either a
 	// numeric or a canonical name, e.g. ":80" or ":https". Could include a host name, e.g.
 	// "localhost:80".
 	// Could be blank: if TLS is not configured, will use ":80", otherwise ":443".
 	// Can be overridden from the command line, see option --listen.
 	Listen string `json:"listen"`
+	// Base URL path where the streaming and large file API calls are served, default is '/'.
+	// Can be overridden from the command line, see option --api_path.
+	ApiPath string `json:"api_path"`
 	// Cache-Control value for static content.
 	CacheControl int `json:"cache_control"`
 	// Address:port to listen for gRPC clients. If blank gRPC support will not be initialized.
@@ -196,7 +203,7 @@ type configType struct {
 	// Enable handling of gRPC keepalives https://github.com/grpc/grpc/blob/master/doc/keepalive.md
 	// This sets server's GRPC_ARG_KEEPALIVE_TIME_MS to 60 seconds instead of the default 2 hours.
 	GrpcKeepalive bool `json:"grpc_keepalive_enabled"`
-	// URL path for mounting the directory with static files.
+	// URL path for mounting the directory with static files (usually TinodeWeb).
 	StaticMount string `json:"static_mount"`
 	// Local path to static files. All files in this path are made accessible by HTTP.
 	StaticData string `json:"static_data"`
@@ -232,14 +239,15 @@ func main() {
 	// Absolute paths are left unchanged.
 	rootpath, _ := filepath.Split(executable)
 
-	log.Printf("Server v%s:%s:%s; db: '%s'; pid %d; %d process(es)",
+	log.Printf("Server v%s:%s:%s; pid %d; %d process(es)",
 		currentVersion, executable, buildstamp,
-		store.GetAdapterName(), os.Getpid(), runtime.GOMAXPROCS(runtime.NumCPU()))
+		os.Getpid(), runtime.GOMAXPROCS(runtime.NumCPU()))
 
 	var configfile = flag.String("config", "tinode.conf", "Path to config file.")
 	// Path to static content.
 	var staticPath = flag.String("static_data", defaultStaticPath, "File path to directory with static files to be served.")
 	var listenOn = flag.String("listen", "", "Override address and port to listen on for HTTP(S) clients.")
+	var apiPath = flag.String("api_path", "", "Override the base URL path where API is served.")
 	var listenGrpc = flag.String("grpc_listen", "", "Override address and port to listen on for gRPC clients.")
 	var tlsEnabled = flag.Bool("tls_enabled", false, "Override config value for enabling TLS.")
 	var clusterSelf = flag.String("cluster_self", "", "Override the name of the current cluster node.")
@@ -254,8 +262,25 @@ func main() {
 	var config configType
 	if file, err := os.Open(*configfile); err != nil {
 		log.Fatal("Failed to read config file: ", err)
-	} else if err = json.NewDecoder(jcr.New(file)).Decode(&config); err != nil {
-		log.Fatal("Failed to parse config file: ", err)
+	} else {
+		if err = json.NewDecoder(jcr.New(file)).Decode(&config); err != nil {
+			// Need to reset file to start in order to convert byte offset to line number and character position.
+			// Ignore possible error: can't use it anyway.
+			file.Seek(0, 0)
+			switch jerr := err.(type) {
+			case *json.UnmarshalTypeError:
+				lnum, cnum, _ := offsetToLineAndChar(file, jerr.Offset)
+				log.Fatalf("Unmarshall error in config file in %s at %d:%d (offset %d bytes): %s",
+					jerr.Field, lnum, cnum, jerr.Offset, jerr.Error())
+			case *json.SyntaxError:
+				lnum, cnum, _ := offsetToLineAndChar(file, jerr.Offset)
+				log.Fatalf("Syntax error in config file at %d:%d (offset %d bytes): %s",
+					lnum, cnum, jerr.Offset, jerr.Error())
+			default:
+				log.Fatal("Failed to parse config file: ", err)
+			}
+		}
+		file.Close()
 	}
 
 	if *listenOn != "" {
@@ -272,7 +297,7 @@ func main() {
 	}
 	statsInit(mux, evpath)
 	statsRegisterInt("Version")
-	statsSet("Version", int64(parseVersion(currentVersion)))
+	statsSet("Version", base10Version(parseVersion(currentVersion)))
 
 	// Initialize serving debug profiles (optional).
 	servePprof(mux, *pprofUrl)
@@ -307,6 +332,7 @@ func main() {
 	if err != nil {
 		log.Fatal("Failed to connect to DB: ", err)
 	}
+	log.Println("DB adapter", store.GetAdapterName())
 	defer func() {
 		store.Close()
 		log.Println("Closed database connection(s)")
@@ -330,7 +356,7 @@ func main() {
 		if authhdl := store.GetLogicalAuthHandler(name); authhdl == nil {
 			log.Fatalln("Unknown authenticator", name)
 		} else if jsconf := config.Auth[name]; jsconf != nil {
-			if err := authhdl.Init(string(jsconf), name); err != nil {
+			if err := authhdl.Init(jsconf, name); err != nil {
 				log.Fatalln("Failed to init auth scheme", name+":", err)
 			}
 			tags, err := authhdl.RestrictedTags()
@@ -537,15 +563,31 @@ func main() {
 		log.Println("Static content is disabled")
 	}
 
+	// Configure root path for serving API calls.
+	if *apiPath != "" {
+		config.ApiPath = *apiPath
+	}
+	if config.ApiPath == "" {
+		config.ApiPath = defaultApiPath
+	} else {
+		if !strings.HasPrefix(config.ApiPath, "/") {
+			config.ApiPath = "/" + config.ApiPath
+		}
+		if !strings.HasSuffix(config.ApiPath, "/") {
+			config.ApiPath += "/"
+		}
+	}
+	log.Printf("API served from root URL path '%s'", config.ApiPath)
+
 	// Handle websocket clients.
-	mux.HandleFunc("/v0/channels", serveWebSocket)
+	mux.HandleFunc(config.ApiPath+"v0/channels", serveWebSocket)
 	// Handle long polling clients. Enable compression.
-	mux.Handle("/v0/channels/lp", gh.CompressHandler(http.HandlerFunc(serveLongPoll)))
+	mux.Handle(config.ApiPath+"v0/channels/lp", gh.CompressHandler(http.HandlerFunc(serveLongPoll)))
 	if config.Media != nil {
 		// Handle uploads of large files.
-		mux.Handle("/v0/file/u/", gh.CompressHandler(http.HandlerFunc(largeFileUpload)))
+		mux.Handle(config.ApiPath+"v0/file/u/", gh.CompressHandler(http.HandlerFunc(largeFileUpload)))
 		// Serve large files.
-		mux.Handle("/v0/file/s/", gh.CompressHandler(http.HandlerFunc(largeFileServe)))
+		mux.Handle(config.ApiPath+"v0/file/s/", gh.CompressHandler(http.HandlerFunc(largeFileServe)))
 		log.Println("Large media handling enabled", config.Media.UseHandler)
 	}
 

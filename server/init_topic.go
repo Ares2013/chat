@@ -96,14 +96,16 @@ func topicInit(t *Topic, sreg *sessionJoin, h *Hub) {
 	statsInc("TotalTopics", 1)
 	usersRegisterTopic(t, true)
 
-	sreg.loaded = true
-
 	// Topic will check access rights, send invite to p2p user, send {ctrl} message to the initiator session
 	if !sreg.internal {
 		t.reg <- sreg
 	}
 
-	t.resume()
+	t.markPaused(false)
+	if t.cat == types.TopicCatFnd || t.cat == types.TopicCatSys {
+		t.markLoaded()
+	}
+
 	go t.run(h)
 }
 
@@ -622,6 +624,38 @@ func initTopicSys(t *Topic, sreg *sessionJoin) error {
 		t.touched = stopic.TouchedAt
 	}
 	t.lastID = stopic.SeqId
+
+	return nil
+}
+
+// loadSubscribers loads topic subscribers, sets topic owner.
+func (t *Topic) loadSubscribers() error {
+	subs, err := store.Topics.GetSubs(t.name, nil)
+	if err != nil {
+		return err
+	}
+
+	if subs == nil {
+		return nil
+	}
+
+	for i := range subs {
+		sub := &subs[i]
+		uid := types.ParseUid(sub.User)
+		t.perUser[uid] = perUserData{
+			created:   sub.CreatedAt,
+			updated:   sub.UpdatedAt,
+			delID:     sub.DelId,
+			readID:    sub.ReadSeqId,
+			recvID:    sub.RecvSeqId,
+			private:   sub.Private,
+			modeWant:  sub.ModeWant,
+			modeGiven: sub.ModeGiven}
+
+		if (sub.ModeGiven & sub.ModeWant).IsOwner() {
+			t.owner = uid
+		}
+	}
 
 	return nil
 }

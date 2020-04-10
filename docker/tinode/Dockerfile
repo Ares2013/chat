@@ -11,7 +11,7 @@
 
 FROM alpine:latest
 
-ARG VERSION=0.16.2
+ARG VERSION=0.16.3
 ENV VERSION=$VERSION
 
 LABEL maintainer="Tinode Team <info@tinode.co>"
@@ -21,7 +21,9 @@ LABEL version=$VERSION
 # Build-time options.
 
 # Database selector. Builds for RethinkDB by default.
-# Alternatively use `--build-arg TARGET_DB=mysql` to build for MySQL.
+# Alternatively use
+# `--build-arg TARGET_DB=mysql` to build for MySQL or
+# `--build-arg TARGET_DB=mongodb` to build for MongoDB.
 ARG TARGET_DB=rethinkdb
 ENV TARGET_DB=$TARGET_DB
 
@@ -75,6 +77,11 @@ ENV FCM_PUSH_ENABLED=false
 
 # Enable Android-specific notifications by default.
 ENV FCM_INCLUDE_ANDROID_NOTIFICATION=true
+
+# Use the target db by default.
+# When TARGET_DB is "alldbs", it is the user's responsibility
+# to set STORE_USE_ADAPTER to the desired db adapter correctly.
+ENV STORE_USE_ADAPTER=$TARGET_DB
 
 # Install root certificates, they are needed for email validator to work
 # with the TLS SMTP servers like Gmail. Also add bash and grep.

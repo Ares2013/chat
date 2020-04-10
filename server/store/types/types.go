@@ -1,3 +1,4 @@
+// Package types provides data types for persisting objects in the databases.
 package types
 
 import (
@@ -214,7 +215,7 @@ func (us UidSlice) find(uid Uid) (int, bool) {
 	return idx, idx < l && us[idx] == uid
 }
 
-// Add uid to UidSlice keeping it sorted.
+// Add uid to UidSlice keeping it sorted. Duplicates are ignored.
 func (us *UidSlice) Add(uid Uid) bool {
 	idx, found := us.find(uid)
 	if found {
@@ -297,11 +298,13 @@ func ParseP2P(p2p string) (uid1, uid2 Uid, err error) {
 
 // ObjHeader is the header shared by all stored objects.
 type ObjHeader struct {
-	Id        string // using string to get around rethinkdb's problems with unit64
+	// using string to get around rethinkdb's problems with uint64;
+	// `bson:"_id"` tag is for mongodb to use as primary key '_id'
+	// 'omitempty' causes mongodb automaticaly create "_id" field if field not set explicitly
+	Id        string `bson:"_id,omitempty"`
 	id        Uid
 	CreatedAt time.Time
 	UpdatedAt time.Time
-	DeletedAt *time.Time `json:"DeletedAt,omitempty"`
 }
 
 // Uid assigns Uid header field.
@@ -329,7 +332,6 @@ func (h *ObjHeader) InitTimes() {
 		h.CreatedAt = TimeNow()
 	}
 	h.UpdatedAt = h.CreatedAt
-	h.DeletedAt = nil
 }
 
 // MergeTimes intelligently copies time.Time variables from h2 to h.
@@ -342,15 +344,6 @@ func (h *ObjHeader) MergeTimes(h2 *ObjHeader) {
 	if h.UpdatedAt.Before(h2.UpdatedAt) {
 		h.UpdatedAt = h2.UpdatedAt
 	}
-	// Set deleted time to the latest value
-	if h2.DeletedAt != nil && (h.DeletedAt == nil || h.DeletedAt.Before(*h2.DeletedAt)) {
-		h.DeletedAt = h2.DeletedAt
-	}
-}
-
-// IsDeleted returns true if the object is deleted.
-func (h *ObjHeader) IsDeleted() bool {
-	return h.DeletedAt != nil
 }
 
 // StringSlice is defined so Scanner and Valuer can be attached to it.
@@ -369,11 +362,88 @@ func (ss StringSlice) Value() (driver.Value, error) {
 	return json.Marshal(ss)
 }
 
+// ObjState represents information on objects state,
+// such as an indication that User or Topic is suspended/soft-deleted.
+type ObjState int
+
+const (
+	StateOK        ObjState = 0
+	StateSuspended ObjState = 10
+	StateDeleted   ObjState = 20
+	StateUndefined ObjState = 30
+)
+
+// String returns string representation of ObjState.
+func (os ObjState) String() string {
+	switch os {
+	case StateOK:
+		return "ok"
+	case StateSuspended:
+		return "susp"
+	case StateDeleted:
+		return "del"
+	case StateUndefined:
+		return "undef"
+	}
+	return ""
+}
+
+// NewObjState parses string into an ObjState.
+func NewObjState(in string) (ObjState, error) {
+	in = strings.ToLower(in)
+	switch in {
+	case "", "ok":
+		return StateOK, nil
+	case "susp":
+		return StateSuspended, nil
+	case "del":
+		return StateDeleted, nil
+	case "undef":
+		return StateUndefined, nil
+	}
+	// This is the default.
+	return StateOK, errors.New("failed to parse object state")
+}
+
+// MarshalJSON converts ObjState to a quoted string.
+func (os ObjState) MarshalJSON() ([]byte, error) {
+	return append(append([]byte{'"'}, []byte(os.String())...), '"'), nil
+}
+
+// UnmarshalJSON reads ObjState from a quoted string.
+func (os *ObjState) UnmarshalJSON(b []byte) error {
+	if b[0] != '"' || b[len(b)-1] != '"' {
+		return errors.New("syntax error")
+	}
+	state, err := NewObjState(string(b[1 : len(b)-1]))
+	if err == nil {
+		*os = state
+	}
+	return err
+}
+
+// Scan is an implementation of sql.Scanner interface. It expects the
+// value to be a byte slice representation of an ASCII string.
+func (os *ObjState) Scan(val interface{}) error {
+	switch intval := val.(type) {
+	case int64:
+		*os = ObjState(intval)
+		return nil
+	}
+	return errors.New("data is not an int64")
+}
+
+// Value is an implementation of sql.driver.Valuer interface.
+func (os ObjState) Value() (driver.Value, error) {
+	return int64(os), nil
+}
+
 // User is a representation of a DB-stored user record.
 type User struct {
-	ObjHeader
+	ObjHeader `bson:",inline"`
 
-	State int
+	State   ObjState
+	StateAt *time.Time `json:"StateAt,omitempty" bson:",omitempty"`
 
 	// Default access to user for P2P topics (used as default modeGiven)
 	Access DefaultAccess
@@ -392,7 +462,9 @@ type User struct {
 	Tags StringSlice
 
 	// Info on known devices, used for push notifications
-	Devices map[string]*DeviceDef
+	Devices map[string]*DeviceDef `bson:"__devices,skip,omitempty"`
+	// Same for mongodb scheme. Ignore in other db backends if its not suitable.
+	DeviceArray []*DeviceDef `json:"-" bson:"devices"`
 }
 
 // AccessMode is a definition of access mode bits.
@@ -659,7 +731,7 @@ func (da DefaultAccess) Value() (driver.Value, error) {
 
 // Credential hold data needed to validate and check validity of a credential like email or phone.
 type Credential struct {
-	ObjHeader
+	ObjHeader `bson:",inline"`
 	// Credential owner
 	User string
 	// Verification method (email, tel, captcha, etc)
@@ -676,11 +748,12 @@ type Credential struct {
 
 // Subscription to a topic
 type Subscription struct {
-	ObjHeader
+	ObjHeader `bson:",inline"`
 	// User who has relationship with the topic
 	User string
 	// Topic subscribed to
-	Topic string
+	Topic     string
+	DeletedAt *time.Time `bson:",omitempty"`
 
 	// Values persisted through subscription soft-deletion
 
@@ -716,6 +789,9 @@ type Subscription struct {
 	with string
 	// P2P only. Default access: this is the mode given by the other user to this user
 	modeDefault *DefaultAccess
+
+	// Topic's or user's state.
+	state ObjState
 }
 
 // SetPublic assigns to public, otherwise not accessible from outside the package.
@@ -792,6 +868,16 @@ func (s *Subscription) GetDefaultAccess() *DefaultAccess {
 	return s.modeDefault
 }
 
+// GetState returns topic's or user's state.
+func (s *Subscription) GetState() ObjState {
+	return s.state
+}
+
+// SetState assigns topic's or user's state.
+func (s *Subscription) SetState(state ObjState) {
+	s.state = state
+}
+
 // Contact is a result of a search for connections
 type Contact struct {
 	Id       string
@@ -809,7 +895,11 @@ type perUserData struct {
 
 // Topic stored in database. Topic's name is Id
 type Topic struct {
-	ObjHeader
+	ObjHeader `bson:",inline"`
+
+	// State of the topic: normal (ok), suspended, deleted
+	State   ObjState
+	StateAt *time.Time `json:"StateAt,omitempty" bson:",omitempty"`
 
 	// Timestamp when the last message has passed through the topic
 	TouchedAt time.Time
@@ -917,16 +1007,18 @@ func (mh MessageHeaders) Value() (driver.Value, error) {
 
 // Message is a stored {data} message
 type Message struct {
-	ObjHeader
+	ObjHeader `bson:",inline"`
+	DeletedAt *time.Time `json:"DeletedAt,omitempty" bson:",omitempty"`
+
 	// ID of the hard-delete operation
-	DelId int `json:"DelId,omitempty"`
+	DelId int `json:"DelId,omitempty" bson:",omitempty"`
 	// List of users who have marked this message as soft-deleted
-	DeletedFor []SoftDelete `json:"DeletedFor,omitempty"`
+	DeletedFor []SoftDelete `json:"DeletedFor,omitempty" bson:",omitempty"`
 	SeqId      int
 	Topic      string
 	// Sender's user ID as string (without 'usr' prefix), could be empty.
 	From    string
-	Head    MessageHeaders `json:"Head,omitempty"`
+	Head    MessageHeaders `json:"Head,omitempty" bson:",omitempty"`
 	Content interface{}
 }
 
@@ -934,7 +1026,7 @@ type Message struct {
 // If the range contains just one ID, Hi is set to 0
 type Range struct {
 	Low int
-	Hi  int `json:"Hi,omitempty"`
+	Hi  int `json:"Hi,omitempty" bson:",omitempty"`
 }
 
 // RangeSorter is a helper type required by 'sort' package.
@@ -994,7 +1086,7 @@ func (rs RangeSorter) Normalize() RangeSorter {
 
 // DelMessage is a log entry of a deleted message range.
 type DelMessage struct {
-	ObjHeader
+	ObjHeader   `bson:",inline"`
 	Topic       string
 	DeletedFor  string
 	DelId       int
@@ -1073,7 +1165,7 @@ const (
 
 // FileDef is a stored record of a file upload
 type FileDef struct {
-	ObjHeader
+	ObjHeader `bson:",inline"`
 	// Status of upload
 	Status int
 	// User who created the file
